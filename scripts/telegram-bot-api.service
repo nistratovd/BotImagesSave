@@ -1,0 +1,33 @@
+[Unit]
+Description=Local Telegram Bot API for media archive
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=botimagessave
+Group=botimagessave
+EnvironmentFile=/etc/botimagessave/telegram-api.env
+StateDirectory=telegram-bot-api
+StateDirectoryMode=0700
+WorkingDirectory=/var/lib/telegram-bot-api
+ExecStartPre=/usr/bin/mkdir -p /var/lib/telegram-bot-api/tmp
+ExecStart=/opt/telegram-bot-api/bin/telegram-bot-api --local --http-ip-address=127.0.0.1 --http-port=8081 --dir=/var/lib/telegram-bot-api --temp-dir=/var/lib/telegram-bot-api/tmp --verbosity=0
+Restart=on-failure
+RestartSec=15
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+CPUQuota=50%
+MemoryMax=768M
+
+[Install]
+WantedBy=multi-user.target

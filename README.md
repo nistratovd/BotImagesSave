@@ -41,7 +41,7 @@ max_file_mb = 20
 min_free_mb = 1024
 ```
 
-`allowed_user_ids` принимает числовые Telegram ID, а не username. `max_file_mb` — от 1 до 20: стандартный Telegram Bot API позволяет скачать файл максимум 20 MB. Большие видео бот отклоняет с сообщением. `min_free_mb` — резерв свободного места; проверяется перед загрузкой и записью. Это не дисковая квота: другие процессы тоже могут расходовать место. При исчерпании резерва загрузка завершается ошибкой, существующие файлы автоматически не удаляются.
+`allowed_user_ids` принимает числовые Telegram ID, а не username. `max_file_mb` — любое положительное целое число (например, 500 или 2000). Через облачный Telegram Bot API скачиваются только файлы до 20 MB; для больших файлов настройте локальный Bot API по разделу ниже. Без него бот объяснит ограничение отправителю, даже если в конфигурации указан больший лимит. `min_free_mb` — резерв свободного места; проверяется перед загрузкой и записью. Это не дисковая квота: другие процессы тоже могут расходовать место. При исчерпании резерва загрузка завершается ошибкой, существующие файлы автоматически не удаляются.
 
 ```bash
 sudo bash scripts/manage.sh start
@@ -147,3 +147,111 @@ BOT_CONFIG=/абсолютный/путь/config.toml .venv/bin/python bot.py
 ```
 
 Для запуска без systemd задайте доступный абсолютный `storage.directory` и держите TOML закрытым. Тесты не требуют Google или Telegram credentials; реальная проверка Telegram описана выше.
+
+
+## Файлы больше 20 MB: локальный Telegram Bot API
+
+Установка большего `max_file_mb` снимает ограничение **бота**, но не ограничение облачного API Telegram. Для фактического скачивания больших файлов нужен официальный [telegram-bot-api](https://github.com/tdlib/telegram-bot-api) с `--local` **на том же сервере**. Этот режим позволяет скачивать без ограничения размера со стороны Bot API; остаются ограничения отправки Telegram, ваш лимит и свободное место. Большие фото отправляйте как файл, чтобы Telegram не сжимал их.
+
+Это дополнительная служба: она слушает только `127.0.0.1:8081`, не требует открытия firewall и не меняет 3x-ui. Сначала проверьте `sudo ss -ltnp`, что порт 8081 свободен. Если занят, выберите другой в unit и TOML. Локальный API не имеет отдельного пароля: не публикуйте его порт и запускайте на доверенном сервере. Бот и API используют одного системного пользователя, чтобы читать скачанные файлы. Для API нужны дополнительные CPU, RAM и дисковое место; на малом VPS проверьте запас ресурсов. Лимит RAM службы API в примере 768 MB, бота — 384 MB.
+
+### Установка API (один раз)
+
+1. Получите **api_id и api_hash** на https://my.telegram.org → API development tools, войдя своим Telegram-аккаунтом. Это отдельные параметры, не токен BotFather. Не присылайте их в чат и не сохраняйте в Git.
+2. Установите бот через `manage.sh install`, если он ещё не установлен (это создаёт пользователя). Соберите официальный API. Сборка требует ресурсов: лучше выполнить её на отдельной Ubuntu 24.04 той же архитектуры, если VPS занят 3x-ui. Ниже ограничен параллелизм; firewall и Docker не меняются.
+
+```bash
+sudo apt-get install -y git cmake g++ gperf libssl-dev zlib1g-dev
+# В отдельном рабочем каталоге, где ещё нет папки telegram-bot-api:
+git clone --recursive https://github.com/tdlib/telegram-bot-api.git
+cd telegram-bot-api
+# Зафиксируйте SHA проверенной версии для последующих обновлений:
+git rev-parse HEAD
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/opt/telegram-bot-api
+cmake --build build -j1
+sudo cmake --install build
+/opt/telegram-bot-api/bin/telegram-bot-api --help
+```
+
+Если upstream меняет требования сборки, используйте официальный build guide из его README. Проверьте, что бинарник установлен именно в `/opt/telegram-bot-api/bin/telegram-bot-api`.
+
+3. Вернитесь в клон **BotImagesSave**. Создайте закрытый файл настроек:
+
+```bash
+sudo install -o root -g root -m 600 /dev/null /etc/botimagessave/telegram-api.env
+sudoedit /etc/botimagessave/telegram-api.env
+```
+
+Содержимое (подставьте свои значения):
+
+```ini
+TELEGRAM_API_ID=12345678
+TELEGRAM_API_HASH=your_api_hash
+```
+
+При повторной настройке редактируйте существующий файл; команда `install /dev/null` обнуляет его.
+
+### Переключение бота
+
+Остановите бота и **один раз** выйдите из облачного API. Helper читает токен из защищённого TOML и не выводит его:
+
+```bash
+sudo bash scripts/manage.sh stop
+sudo /opt/botimagessave/.venv/bin/python scripts/telegram_logout.py
+```
+
+Продолжайте только после `Cloud logOut succeeded`. Согласно Telegram, после этого нельзя войти обратно в облачный API 10 минут; локальный сервер можно запускать сразу. Не выполняйте этот helper при каждом рестарте.
+
+```bash
+sudo install -m 644 scripts/telegram-bot-api.service /etc/systemd/system/telegram-bot-api.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now telegram-bot-api
+sudo systemctl status telegram-bot-api --no-pager
+sudoedit /etc/botimagessave/config.toml
+```
+
+Добавьте параметры в **существующие** разделы TOML, не создавая повторные:
+
+```toml
+[telegram]
+# Сохраните здесь token, greeting и allowed_user_ids.
+local_api_url = "http://127.0.0.1:8081"
+local_file_root = "/var/lib/telegram-bot-api"
+
+[storage]
+# Сохраните directory и min_free_mb.
+max_file_mb = 500
+```
+
+`local_file_root` — каталог данных API, не каталог архива. Бот принимает локальные пути только внутри него. API должен работать с `--local`; HTTP-сервер в другом режиме не подходит. Внешние адреса в `local_api_url` намеренно запрещены.
+
+Чтобы API запускался перед ботом, выполните `sudo systemctl edit botimagessave` и добавьте:
+
+```ini
+[Unit]
+Requires=telegram-bot-api.service
+After=telegram-bot-api.service
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo bash scripts/manage.sh reinstall
+sudo systemctl reset-failed botimagessave
+sudo bash scripts/manage.sh start
+```
+
+Отправьте тестовое видео размером, например, 30 MB (меньше заданного лимита). Проверьте «Сохранено.» и фактический файл в архиве. Полная проверка требует реальных Telegram credentials; модульные тесты проверяют маршрутизацию запросов и чтение локального файла без Telegram.
+
+### Место на диске, отключение и удаление API
+
+API хранит собственные скачанные данные в `/var/lib/telegram-bot-api`, отдельно от постоянного архива. При сохранении бот использует ещё временную и конечную копию. Планируйте место под API-кэш, архив, две копии обрабатываемого файла и резерв. Большие локальные файлы копируются по частям без загрузки целиком в RAM. Резерв `min_free_mb` проверяет диск архива, не отдельный диск API. Следите за обоими. Не удаляйте файлы API во время работы; не настраивайте бездумное удаление всего каталога — там же состояние и авторизация.
+
+`manage.sh stop/uninstall` управляет только ботом. Для остановки также API:
+
+```bash
+sudo systemctl disable --now telegram-bot-api
+```
+
+Для полного удаления API после остановки бота: удалите его unit `/etc/systemd/system/telegram-bot-api.service`, выполните `sudo systemctl daemon-reload`, удалите бинарники `/opt/telegram-bot-api`, закрытый файл `telegram-api.env` и, если не нужны, данные `/var/lib/telegram-bot-api`. Архив `/var/lib/botimagessave/media` удалять не требуется. Уберите override `Requires/After` для API, прежде чем возвращаться в облачный режим.
+
+Для возврата в облако остановите бота, вызовите метод Telegram `logOut` **на локальном API** безопасным инструментом, остановите API, очистите `local_api_url` в TOML и установите `max_file_mb = 20`. Helper выше предназначен только для выхода из облака. Не запускайте облачный и локальный экземпляры одновременно.

@@ -3,9 +3,13 @@ token = "PUT_BOTFATHER_TOKEN_HERE"
 greeting = "Привет!"
 # Пустой список разрешает всем. Иначе укажите числовые Telegram ID.
 allowed_user_ids = []
+# Для скачивания >20 MB нужен отдельный Telegram Bot API server с --local.
+# Инструкция настройки находится в README. Пустой URL = облачный API Telegram.
+local_api_url = ""
+local_file_root = "/var/lib/telegram-bot-api"
 
 [storage]
-# Облачный Telegram Bot API позволяет скачивать файлы размером до 20 MB.
+# Любое положительное целое число. Для >20 MB настройте local_api_url.
 max_file_mb = 20
 # Загрузка последовательно; временные файлы удаляются после обработки.
 directory = "/var/lib/botimagessave/media"

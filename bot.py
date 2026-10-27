@@ -4,6 +4,7 @@ import logging
 import os
 import shutil
 import uuid
+from urllib.parse import urlsplit
 from pathlib import Path
 import tempfile
 import tomllib
@@ -21,8 +22,19 @@ def load_config(path):
     if not cfg["telegram"]["token"] or cfg["telegram"]["token"].startswith("PUT_"):
         raise ValueError("Configure telegram.token")
     limit = cfg.get("storage", {}).get("max_file_mb", 20)
-    if not isinstance(limit, int) or not 1 <= limit <= 20:
-        raise ValueError("max_file_mb must be 1..20")
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+        raise ValueError("max_file_mb must be a positive integer")
+    local_url = cfg["telegram"].get("local_api_url", "").rstrip("/")
+    if local_url:
+        url = urlsplit(local_url)
+        if (url.scheme != "http" or url.hostname not in ("127.0.0.1", "localhost", "::1")
+                or url.username or url.password or url.path or url.query or url.fragment):
+            raise ValueError("local_api_url must be an HTTP loopback address without a path")
+        root = Path(cfg["telegram"].get("local_file_root", "/var/lib/telegram-bot-api"))
+        if not root.is_absolute():
+            raise ValueError("local_file_root must be absolute")
+        cfg["telegram"]["local_file_root"] = str(root)
+    cfg["telegram"]["local_api_url"] = local_url
     storage = cfg.setdefault("storage", {})
     directory = Path(storage.get("directory", DEFAULT_STORAGE))
     if not directory.is_absolute():
@@ -117,12 +129,27 @@ def make_app(cfg, storage):
         if not item.file_size or item.file_size > cfg["limit"]:
             await message.reply_text("Файл слишком большой. Максимум: %s MB." % (cfg["limit"] // 1024**2))
             return
+        if not cfg["telegram"].get("local_api_url") and item.file_size > 20 * 1024**2:
+            await message.reply_text(
+                "Для файлов больше 20 MB администратор должен подключить локальный Telegram Bot API.")
+            return
         try:
-            storage.check_space(item.file_size)
+            storage.check_space(item.file_size * 2)
             with tempfile.TemporaryDirectory(prefix=".tg-media-", dir=storage.root) as tmp:
                 path = Path(tmp) / "upload"
-                remote = await item.get_file()
-                await remote.download_to_drive(path)
+                remote = await item.get_file(read_timeout=600)
+                if cfg["telegram"].get("local_api_url"):
+                    # --local returns an absolute path, readable by this service.
+                    # Copy in a worker instead of buffering large files in RAM.
+                    source = Path(remote.file_path or "")
+                    root = Path(cfg["telegram"]["local_file_root"]).resolve()
+                    if not source.is_absolute() or not source.resolve().is_relative_to(root):
+                        raise ValueError("Bot API returned a path outside local_file_root")
+                    if not source.is_file() or source.stat().st_size > cfg["limit"]:
+                        raise ValueError("Local file missing or exceeds configured limit")
+                    await asyncio.to_thread(shutil.copyfile, source, path)
+                else:
+                    await remote.download_to_drive(path)
                 if path.stat().st_size > cfg["limit"]:
                     raise ValueError("Downloaded file exceeds limit")
                 kind = media_type(path)
@@ -140,7 +167,13 @@ def make_app(cfg, storage):
     async def error_handler(update, context):
         LOG.warning("Update failed (%s)", type(context.error).__name__)
 
-    app = Application.builder().token(cfg["telegram"]["token"]).concurrent_updates(False).build()
+    builder = Application.builder().token(cfg["telegram"]["token"]).concurrent_updates(False)
+    local_url = cfg["telegram"].get("local_api_url")
+    if local_url:
+        builder = (builder.base_url(local_url + "/bot")
+                   .base_file_url(local_url + "/file/bot").local_mode(True)
+                   .read_timeout(600).write_timeout(600))
+    app = builder.build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO | filters.Document.ALL, receive))
     app.add_error_handler(error_handler)
