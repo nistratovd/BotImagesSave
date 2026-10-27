@@ -1,20 +1,18 @@
-"""Telegram media archive. No listening sockets; OAuth files stay outside Git."""
+"""Telegram media archive. No listening sockets; Files stay in private local user folders."""
 import asyncio
 import logging
 import os
+import shutil
+import uuid
 from pathlib import Path
 import tempfile
 import tomllib
 
-from google.auth.transport.requests import Request
-from google.oauth2.credentials import Credentials
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
 LOG = logging.getLogger("media_archive")
-SCOPES = ["https://www.googleapis.com/auth/drive.file"]
+DEFAULT_STORAGE = "/var/lib/botimagessave/media"
 
 
 def load_config(path):
@@ -22,11 +20,18 @@ def load_config(path):
         cfg = tomllib.load(source)
     if not cfg["telegram"]["token"] or cfg["telegram"]["token"].startswith("PUT_"):
         raise ValueError("Configure telegram.token")
-    if not cfg["google"]["root_folder_id"] or cfg["google"]["root_folder_id"].startswith("PUT_"):
-        raise ValueError("Configure google.root_folder_id")
     limit = cfg.get("storage", {}).get("max_file_mb", 20)
     if not isinstance(limit, int) or not 1 <= limit <= 20:
         raise ValueError("max_file_mb must be 1..20")
+    storage = cfg.setdefault("storage", {})
+    directory = Path(storage.get("directory", DEFAULT_STORAGE))
+    if not directory.is_absolute():
+        raise ValueError("storage.directory must be absolute")
+    reserve = storage.get("min_free_mb", 1024)
+    if not isinstance(reserve, int) or isinstance(reserve, bool) or reserve < 0:
+        raise ValueError("storage.min_free_mb must be a nonnegative integer")
+    storage["directory"] = str(directory)
+    storage["min_free_mb"] = reserve
     cfg["limit"] = limit * 1024 * 1024
     return cfg
 
@@ -49,40 +54,49 @@ def media_type(path):
     return None
 
 
-class Drive:
+class LocalStorage:
     def __init__(self, cfg):
-        self.token_path = Path(cfg["token_file"])
-        self.credentials = Credentials.from_authorized_user_file(self.token_path, SCOPES)
-        self.service = build("drive", "v3", credentials=self.credentials, cache_discovery=False)
-        self.root = cfg["root_folder_id"]
-        self.folders = {}
+        self.root = Path(cfg.get("directory", DEFAULT_STORAGE))
+        self.reserve = cfg.get("min_free_mb", 1024) * 1024 * 1024
 
     def check(self):
-        root = self.service.files().get(fileId=self.root, fields="mimeType,capabilities(canAddChildren)").execute()
-        if root["mimeType"] != "application/vnd.google-apps.folder" or not root.get("capabilities", {}).get("canAddChildren"):
-            raise ValueError("Google root must be a writable folder")
+        self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if self.root.is_symlink():
+            raise ValueError("Storage directory must not be a symlink")
+        with tempfile.TemporaryFile(dir=self.root):
+            pass
+        self.check_space(0)
 
-    def upload(self, user_id, path, name, mime):
-        # Calls are serialized by the bot; Google HTTP client is not thread safe.
-        user = str(int(user_id))
-        if user not in self.folders:
-            # Root is provided by configuration, escape query literals.
-            root = self.root.replace("\\", "\\\\").replace("'", "\\'")
-            found = self.service.files().list(
-                q=f"'{root}' in parents and name = '{user}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false",
-                fields="files(id)", pageSize=1).execute().get("files", [])
-            folder = found[0]["id"] if found else self.service.files().create(
-                body={"name": user, "mimeType": "application/vnd.google-apps.folder", "parents": [self.root]}, fields="id").execute()["id"]
-            self.folders[user] = folder
-        media = MediaFileUpload(str(path), mimetype=mime, resumable=True, chunksize=1024 * 1024)
+    def check_space(self, size):
+        if shutil.disk_usage(self.root).free < self.reserve + size:
+            raise OSError("Insufficient free disk space")
+
+    def save(self, user_id, path, name):
+        # Only internal names are accepted; never use names supplied by Telegram.
+        if Path(name).name != name or name in (".", ".."):
+            raise ValueError("Invalid file name")
+        folder = self.root / str(int(user_id))
+        folder.mkdir(mode=0o700, exist_ok=True)
+        if folder.is_symlink():
+            raise ValueError("User folder must not be a symlink")
+        self.check_space(path.stat().st_size)
+        destination = folder / f"{Path(name).stem}_{uuid.uuid4().hex}{Path(name).suffix}"
+        temporary = None
         try:
-            self.service.files().create(body={"name": name, "parents": [self.folders[user]]},
-                                        media_body=media, fields="id").execute(num_retries=3)
+            with tempfile.NamedTemporaryFile(dir=folder, prefix=".pending-", delete=False) as out:
+                temporary = Path(out.name)
+                with path.open("rb") as source:
+                    shutil.copyfileobj(source, out)
+                out.flush()
+                os.fsync(out.fileno())
+            os.replace(temporary, destination)
         finally:
-            media.stream().close()
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+        return destination
 
 
-def make_app(cfg, drive):
+def make_app(cfg, storage):
     allowed = set(cfg["telegram"].get("allowed_user_ids", []))
 
     def authorized(update):
@@ -104,7 +118,8 @@ def make_app(cfg, drive):
             await message.reply_text("Файл слишком большой. Максимум: %s MB." % (cfg["limit"] // 1024**2))
             return
         try:
-            with tempfile.TemporaryDirectory(prefix="tg-media-") as tmp:
+            storage.check_space(item.file_size)
+            with tempfile.TemporaryDirectory(prefix=".tg-media-", dir=storage.root) as tmp:
                 path = Path(tmp) / "upload"
                 remote = await item.get_file()
                 await remote.download_to_drive(path)
@@ -113,9 +128,9 @@ def make_app(cfg, drive):
                 kind = media_type(path)
                 if not kind:
                     return
-                mime, suffix = kind
+                _, suffix = kind
                 name = f"{message.chat_id}_{message.message_id}{suffix}"
-                await asyncio.to_thread(drive.upload, update.effective_user.id, path, name, mime)
+                await asyncio.to_thread(storage.save, update.effective_user.id, path, name)
             await message.reply_text("Сохранено.")
         except Exception as error:
             # Never log request URLs, exceptions or tokens.
@@ -134,14 +149,15 @@ def make_app(cfg, drive):
 
 def main():
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
+    os.umask(0o077)
     cfg = load_config(os.environ.get("BOT_CONFIG", "/etc/botimagessave/config.toml"))
     try:
-        drive = Drive(cfg["google"])
-        drive.check()
+        storage = LocalStorage(cfg["storage"])
+        storage.check()
     except Exception as error:
-        LOG.error("Google Drive startup check failed (%s)", type(error).__name__)
+        LOG.error("Local storage startup check failed (%s)", type(error).__name__)
         raise SystemExit(1) from None
-    make_app(cfg, drive).run_polling(allowed_updates=["message"], drop_pending_updates=False)
+    make_app(cfg, storage).run_polling(allowed_updates=["message"], drop_pending_updates=False)
 
 
 if __name__ == "__main__":

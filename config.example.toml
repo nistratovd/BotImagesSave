@@ -4,13 +4,10 @@ greeting = "Привет!"
 # Пустой список разрешает всем. Иначе укажите числовые Telegram ID.
 allowed_user_ids = []
 
-[google]
-# OAuth пользователя: файлы расходуют место его Google Drive.
-token_file = "/etc/botimagessave/secrets/token.json"
-# ID заранее созданной папки Google Drive.
-root_folder_id = "PUT_FOLDER_ID_HERE"
-
 [storage]
 # Облачный Telegram Bot API позволяет скачивать файлы размером до 20 MB.
 max_file_mb = 20
 # Загрузка последовательно; временные файлы удаляются после обработки.
+directory = "/var/lib/botimagessave/media"
+# Минимум свободного места, оставляемый на диске (MB).
+min_free_mb = 1024

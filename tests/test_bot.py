@@ -17,23 +17,58 @@ class MediaTests(unittest.TestCase):
                 result = bot.media_type(path)
                 self.assertEqual(result[0] if result else None, expected)
 
-    def test_upload_reuses_user_folder(self):
-        drive = bot.Drive.__new__(bot.Drive)
-        drive.root = 'root'
-        drive.folders = {}
-        drive.service = MagicMock()
-        files = drive.service.files.return_value
-        files.list.return_value.execute.return_value = {'files': [{'id': 'existing'}]}
-        with patch('bot.MediaFileUpload'):
-            drive.upload(123, '/unused', 'one.jpg', 'image/jpeg')
-            drive.upload(123, '/unused', 'two.jpg', 'image/jpeg')
-        self.assertEqual(files.list.call_count, 1)
-        self.assertEqual(files.create.call_count, 2)
-        self.assertEqual(files.create.call_args.kwargs['body']['parents'], ['existing'])
+    def test_config_requires_no_google_settings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'config.toml'
+            path.write_text('[telegram]\ntoken = "123:test"\n')
+            cfg = bot.load_config(path)
+            self.assertEqual(cfg['storage']['directory'], bot.DEFAULT_STORAGE)
+            self.assertEqual(cfg['storage']['min_free_mb'], 1024)
+            path.write_text('[telegram]\ntoken = "123:test"\n[storage]\ndirectory = "relative"\n')
+            with self.assertRaises(ValueError):
+                bot.load_config(path)
 
+    def test_local_save_survives_restart_and_keeps_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = {'directory': str(Path(tmp) / 'archive'), 'min_free_mb': 0}
+            storage = bot.LocalStorage(cfg)
+            storage.check()
+            source = Path(tmp) / 'input'
+            source.write_bytes(b'photo')
+            one = storage.save(123, source, '1.jpg')
+            storage = bot.LocalStorage(cfg)
+            storage.check()
+            two = storage.save(123, source, '1.jpg')
+            other = storage.save(456, source, '1.jpg')
+            self.assertNotEqual(one, two)
+            self.assertEqual(one.parent, two.parent)
+            self.assertNotEqual(one.parent, other.parent)
+            self.assertEqual(one.read_bytes(), b'photo')
+            self.assertEqual(two.read_bytes(), b'photo')
+            self.assertEqual(one.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(list(one.parent.glob('.pending-*')), [])
 
-if __name__ == '__main__':
-    unittest.main()
+    def test_storage_failure_cleans_partial_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = bot.LocalStorage({'directory': tmp, 'min_free_mb': 0})
+            source = Path(tmp) / 'input'
+            source.write_bytes(b'photo')
+            with patch('bot.shutil.copyfileobj', side_effect=OSError('disk full')):
+                with self.assertRaises(OSError):
+                    storage.save(123, source, '1.jpg')
+            self.assertEqual(list((Path(tmp) / '123').iterdir()), [])
+
+    def test_low_space_and_symlink_are_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = bot.LocalStorage({'directory': tmp, 'min_free_mb': 1})
+            with patch('bot.shutil.disk_usage') as usage:
+                usage.return_value.free = 0
+                with self.assertRaises(OSError):
+                    storage.check_space(10)
+            (Path(tmp) / '123').symlink_to(tmp, target_is_directory=True)
+            with self.assertRaises(ValueError):
+                storage.save(123, Path(tmp) / 'unused', '1.jpg')
+
 
 class HandlerTests(unittest.IsolatedAsyncioTestCase):
     def config(self):
@@ -42,8 +77,8 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_start_and_reject_non_media(self):
         from unittest.mock import AsyncMock
-        drive = MagicMock()
-        app = bot.make_app(self.config(), drive)
+        storage = MagicMock()
+        app = bot.make_app(self.config(), storage)
         update = MagicMock()
         update.effective_chat.type = 'private'
         update.effective_user.id = 123
@@ -54,12 +89,16 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         update.message.video = None
         update.message.document.mime_type = 'application/pdf'
         await app.handlers[0][1].callback(update, None)
-        drive.upload.assert_not_called()
+        storage.save.assert_not_called()
 
     async def test_photo_saved_and_temp_removed(self):
         from unittest.mock import AsyncMock
-        drive = MagicMock()
-        app = bot.make_app(self.config(), drive)
+        storage = MagicMock()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        storage = bot.LocalStorage({'directory': tmp.name, 'min_free_mb': 0})
+        storage.check()
+        app = bot.make_app(self.config(), storage)
         update = MagicMock()
         update.effective_chat.type = 'private'
         update.effective_user.id = 123
@@ -76,29 +115,33 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         item.get_file = AsyncMock(return_value=remote)
         update.message.photo = [item]
         await app.handlers[0][1].callback(update, None)
-        drive.upload.assert_called_once()
-        args = drive.upload.call_args.args
-        self.assertEqual((args[0], args[2], args[3]), (123, '123_5.jpg', 'image/jpeg'))
-        self.assertFalse(Path(args[1]).exists())
+        saved = list((Path(tmp.name) / '123').glob('*.jpg'))
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(saved[0].read_bytes(), b'\xff\xd8\xffphoto')
+        self.assertEqual(list(Path(tmp.name).glob('.tg-media-*')), [])
         update.message.reply_text.assert_awaited_once_with('Сохранено.')
 
     async def test_disallowed_user_and_large_video(self):
         from unittest.mock import AsyncMock
         cfg = self.config()
         cfg['telegram']['allowed_user_ids'] = [999]
-        drive = MagicMock()
+        storage = MagicMock()
         update = MagicMock()
         update.effective_chat.type = 'private'
         update.effective_user.id = 123
         update.message.reply_text = AsyncMock()
-        app = bot.make_app(cfg, drive)
+        app = bot.make_app(cfg, storage)
         await app.handlers[0][1].callback(update, None)
         update.message.reply_text.assert_not_awaited()
         cfg['telegram']['allowed_user_ids'] = []
-        app = bot.make_app(cfg, drive)
+        app = bot.make_app(cfg, storage)
         update.message.photo = []
         update.message.document = None
         update.message.video.file_size = cfg['limit'] + 1
         await app.handlers[0][1].callback(update, None)
         update.message.reply_text.assert_awaited_once()
-        drive.upload.assert_not_called()
+        storage.save.assert_not_called()
+
+
+if __name__ == "__main__":
+    unittest.main()

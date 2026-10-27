@@ -1,5 +1,5 @@
 [Unit]
-Description=Telegram Google Drive media archive
+Description=Telegram local media archive
 Wants=network-online.target
 After=network-online.target
 StartLimitIntervalSec=300
@@ -15,6 +15,8 @@ Environment=PYTHONDONTWRITEBYTECODE=1
 ExecStart=/opt/botimagessave/.venv/bin/python /opt/botimagessave/bot.py
 Restart=on-failure
 RestartSec=15
+StateDirectory=botimagessave
+StateDirectoryMode=0700
 UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true

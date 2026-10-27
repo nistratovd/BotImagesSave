@@ -16,13 +16,13 @@ install|reinstall)
   install -m 644 "$SRC/bot.py" "$SRC/requirements.txt" "$APP/"
   python3 -m venv "$APP/.venv"
   "$APP/.venv/bin/pip" install --disable-pip-version-check -r "$APP/requirements.txt"
-  install -d -o root -g "$NAME" -m 750 "$CONF" "$CONF/secrets"
+  install -d -o root -g "$NAME" -m 750 "$CONF"
   if [[ ! -f "$CONF/config.toml" ]]; then
     install -o root -g "$NAME" -m 640 "$SRC/config.example.toml" "$CONF/config.toml"
   fi
   install -m 644 "$SRC/scripts/botimagessave.service" /etc/systemd/system/botimagessave.service
   systemctl daemon-reload
-  echo "Installed. Configure $CONF/config.toml and secrets/token.json, then run: sudo bash scripts/manage.sh start"
+  echo "Installed. Configure $CONF/config.toml, then run: sudo bash scripts/manage.sh start"
   ;;
 start) systemctl enable --now "$NAME" ;;
 stop) systemctl disable --now "$NAME" ;;
@@ -34,14 +34,13 @@ uninstall)
   rm -f /etc/systemd/system/botimagessave.service
   systemctl daemon-reload
   rm -rf -- "$APP"
-  echo "Removed program. Configuration and credentials retained in $CONF; Google files untouched."
+  echo "Removed program. Configuration and credentials retained in $CONF; Local media archive retained in /var/lib/botimagessave (or configured directory)."
   ;;
 purge)
-  if [[ ${2:-} != --confirm ]]; then echo 'Deletes local configuration and OAuth token. Use purge --confirm'; exit 1; fi
+  if [[ ${2:-} != --confirm ]]; then echo 'Deletes local configuration. Media archive is retained. Use purge --confirm'; exit 1; fi
   if [[ -e /etc/systemd/system/botimagessave.service ]]; then echo 'Run uninstall first'; exit 1; fi
   rm -rf -- "$CONF"
-  if id "$NAME" >/dev/null 2>&1; then userdel "$NAME"; fi
-  echo 'Local credentials removed; revoke OAuth access in Google account settings if no longer needed.'
+  echo 'Configuration removed. Media archive and its system user retained to preserve file ownership.'
   ;;
 *) echo 'Usage: manage.sh install|reinstall|start|stop|restart|status|logs|uninstall|purge --confirm'; exit 2 ;;
 esac
