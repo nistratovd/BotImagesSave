@@ -1,0 +1,35 @@
+[Unit]
+Description=Telegram Google Drive media archive
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=botimagessave
+Group=botimagessave
+WorkingDirectory=/opt/botimagessave
+Environment=BOT_CONFIG=/etc/botimagessave/config.toml
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/botimagessave/.venv/bin/python /opt/botimagessave/bot.py
+Restart=on-failure
+RestartSec=15
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+MemoryMax=384M
+CPUQuota=30%
+TasksMax=32
+
+[Install]
+WantedBy=multi-user.target
