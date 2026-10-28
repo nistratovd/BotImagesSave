@@ -100,12 +100,31 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         update.effective_user.id = 123
         update.message.reply_text = AsyncMock()
         await app.handlers[0][0].callback(update, None)
-        update.message.reply_text.assert_awaited_once_with('Привет!')
+        update.message.reply_text.assert_awaited_once_with('Привет!', parse_mode=None)
         update.message.photo = []
         update.message.video = None
         update.message.document.mime_type = 'application/pdf'
         await app.handlers[0][1].callback(update, None)
         storage.save.assert_not_called()
+
+    async def test_formatted_greeting_from_example(self):
+        from unittest.mock import AsyncMock
+        import tomllib
+        with open('config.example.toml', 'rb') as source:
+            cfg = tomllib.load(source)
+        app = bot.make_app(cfg, MagicMock())
+        update = MagicMock()
+        update.effective_chat.type = 'private'
+        update.effective_user.id = 123
+        update.message.reply_text = AsyncMock()
+        await app.handlers[0][0].callback(update, None)
+        text = cfg['telegram']['greeting']
+        self.assertTrue(text.startswith('<b>Привет!</b>'))
+        self.assertIn('500 МБ', text)
+        self.assertIn('<b>User</b> (@nikuser)', text)
+        self.assertIn('\n\n', text)
+        self.assertLess(len(text), 4096)
+        update.message.reply_text.assert_awaited_once_with(text, parse_mode='HTML')
 
     async def test_photo_saved_and_temp_removed(self):
         from unittest.mock import AsyncMock

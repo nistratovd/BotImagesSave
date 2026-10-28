@@ -21,6 +21,8 @@ def load_config(path):
         cfg = tomllib.load(source)
     if not cfg["telegram"]["token"] or cfg["telegram"]["token"].startswith("PUT_"):
         raise ValueError("Configure telegram.token")
+    if cfg["telegram"].get("greeting_parse_mode", "") not in ("", "HTML"):
+        raise ValueError('greeting_parse_mode must be "HTML" or empty for plain text')
     limit = cfg.get("storage", {}).get("max_file_mb", 20)
     if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
         raise ValueError("max_file_mb must be a positive integer")
@@ -117,7 +119,10 @@ def make_app(cfg, storage):
 
     async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if authorized(update):
-            await update.message.reply_text(cfg["telegram"].get("greeting", "Привет!"))
+            await update.message.reply_text(
+                cfg["telegram"].get("greeting", "Привет!"),
+                parse_mode=cfg["telegram"].get("greeting_parse_mode") or None,
+            )
 
     async def receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not authorized(update):
