@@ -11,11 +11,63 @@ class MediaTests(unittest.TestCase):
             path = Path(tmp) / 'file'
             for content, expected in [(b'\xff\xd8\xffdata', 'image/jpeg'),
                                       (b'\x89PNG\r\n\x1a\n', 'image/png'),
-                                      (b'\x00\x00\x00\x18ftypisom', 'video/mp4'),
+                                      (b'\x00\x00\x00\x10ftypisom\x00\x00\x00\x00', 'video/mp4'),
                                       (b'#!/bin/sh', None)]:
                 path.write_bytes(content)
                 result = bot.media_type(path)
                 self.assertEqual(result[0] if result else None, expected)
+
+    def test_iso_container_brands(self):
+        def ftyp(major, compatible=(), extended=False):
+            payload = major + b'\0' * 4 + b''.join(compatible)
+            if extended:
+                return b'\0\0\0\1ftyp' + (16 + len(payload)).to_bytes(8, 'big') + payload
+            return (8 + len(payload)).to_bytes(4, 'big') + b'ftyp' + payload
+
+        cases = [
+            (ftyp(b'heic', (b'mif1',)), ('image/heic', '.heic')),
+            (ftyp(b'mif1', (b'isom', b'heix')), ('image/heic', '.heic')),
+            (ftyp(b'hevc', (b'msf1',)), ('image/heic-sequence', '.heics')),
+            (ftyp(b'mif1'), ('image/heif', '.heif')),
+            (ftyp(b'msf1'), ('image/heif-sequence', '.heifs')),
+            (ftyp(b'avif', (b'mif1',)), ('image/avif', '.avif')),
+            (ftyp(b'qt  '), ('video/quicktime', '.mov')),
+            (ftyp(b'mp42', (b'isom',)), ('video/mp4', '.mp4')),
+            (ftyp(b'heic', extended=True), ('image/heic', '.heic')),
+            (ftyp(b'M4A '), None),
+            (ftyp(b'zzzz'), None),
+            (ftyp(b'heic')[:-1], None),
+            (b'\0\0\0\x08ftyp', None),
+            (b'\0\0\0\1ftyp', None),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'file'
+            for data, expected in cases:
+                with self.subTest(data=data):
+                    path.write_bytes(data)
+                    self.assertEqual(bot.media_type(path), expected)
+
+    def test_repair_preview_apply_and_collision(self):
+        from scripts.fix_image_extensions import repair
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            image = b'\0\0\0\x10ftypheic\0\0\0\0'
+            source = root / 'image.mp4'
+            source.write_bytes(image)
+            video = root / 'video.mp4'
+            video.write_bytes(b'\0\0\0\x10ftypmp42\0\0\0\0')
+            with patch('builtins.print'):
+                self.assertEqual(repair(root), 1)
+                self.assertTrue(source.exists())
+                self.assertFalse(source.with_suffix('.heic').exists())
+                self.assertEqual(repair(root, apply=True), 1)
+                self.assertFalse(source.exists())
+                self.assertEqual(source.with_suffix('.heic').read_bytes(), image)
+                self.assertTrue(video.exists())
+                source.write_bytes(image)
+                self.assertEqual(repair(root, apply=True), 0)
+                self.assertTrue(source.exists())
+                self.assertEqual(source.with_suffix('.heic').read_bytes(), image)
 
     def test_config_requires_no_google_settings(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -164,7 +216,7 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
             api.mkdir()
             source = api / 'video.mp4'
             with source.open('wb') as out:
-                out.write(b'\x00\x00\x00\x18ftypisom')
+                out.write(b'\x00\x00\x00\x10ftypisom\x00\x00\x00\x00')
                 out.truncate(21 * 1024**2)
             storage = bot.LocalStorage({'directory': str(root / 'archive'), 'min_free_mb': 0})
             storage.check()
@@ -205,6 +257,44 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
             await app.handlers[0][1].callback(update, None)
             self.assertIn('Не удалось', message.reply_text.call_args.args[0])
             self.assertEqual(len(list((storage.root / '123').iterdir())), 1)
+
+    async def test_heic_document_keeps_bytes_and_extension(self):
+        from unittest.mock import AsyncMock
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = bot.LocalStorage({'directory': tmp, 'min_free_mb': 0})
+            storage.check()
+            app = bot.make_app(self.config(), storage)
+            update = MagicMock()
+            update.effective_chat.type = 'private'
+            update.effective_user.id = 123
+            message = update.message
+            message.photo = []
+            message.video = None
+            message.chat_id = 123
+            message.message_id = 11
+            message.reply_text = AsyncMock()
+            item = message.document
+            item.mime_type = 'application/octet-stream'
+            item.file_name = 'photo.HEIC'
+            data = b'\0\0\0\x18ftypheic\0\0\0\0mif1heic' + b'original image bytes'
+            item.file_size = len(data)
+            remote = MagicMock()
+            async def download(path):
+                Path(path).write_bytes(data)
+            remote.download_to_drive = AsyncMock(side_effect=download)
+            item.get_file = AsyncMock(return_value=remote)
+            await app.handlers[0][1].callback(update, None)
+            saved = list((storage.root / '123').iterdir())
+            self.assertEqual(len(saved), 1)
+            self.assertEqual(saved[0].suffix, '.heic')
+            self.assertEqual(saved[0].read_bytes(), data)
+            message.reply_text.assert_awaited_once_with('Сохранено.')
+            # A misleading suffix must not allow a non-image through.
+            data = b'not a photo'
+            message.reply_text.reset_mock()
+            await app.handlers[0][1].callback(update, None)
+            self.assertEqual(len(list((storage.root / '123').iterdir())), 1)
+            message.reply_text.assert_not_awaited()
 
     async def test_disallowed_user_and_large_video(self):
         from unittest.mock import AsyncMock

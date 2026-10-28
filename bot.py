@@ -50,17 +50,62 @@ def load_config(path):
     return cfg
 
 
+# ISO BMFF containers share an ftyp header: the brands identify their media type.
+ISO_IMAGE_BRANDS = {
+    **dict.fromkeys((b"heic", b"heix", b"heim", b"heis"), ("image/heic", ".heic")),
+    **dict.fromkeys((b"hevc", b"hevx", b"hevm", b"hevs"), ("image/heic-sequence", ".heics")),
+    b"avif": ("image/avif", ".avif"),
+    b"avis": ("image/avif-sequence", ".avifs"),
+}
+ISO_GENERIC_IMAGE_BRANDS = {
+    b"mif1": ("image/heif", ".heif"),
+    b"msf1": ("image/heif-sequence", ".heifs"),
+}
+ISO_VIDEO_BRANDS = {b"isom", b"mp41", b"mp42", b"avc1", b"dash", b"M4V ", b"F4V ", b"MSNV"}
+ISO_VIDEO_BRANDS.update(f"iso{i}".encode() for i in range(2, 10))
+ISO_IMAGE_EXTENSIONS = {kind[1] for kind in (*ISO_IMAGE_BRANDS.values(), *ISO_GENERIC_IMAGE_BRANDS.values())}
+
+
+def iso_media_type(header):
+    size = int.from_bytes(header[:4], "big")
+    offset = 8
+    if size == 1:  # Extended-size box.
+        if len(header) < 16:
+            return None
+        size = int.from_bytes(header[8:16], "big")
+        offset = 16
+    if size < offset + 8 or size > len(header) or (size - offset - 8) % 4:
+        return None
+    major = header[offset:offset + 4]
+    compatible = [header[i:i + 4] for i in range(offset + 8, size, 4)]
+    # Specific image brands override generic mif1/msf1 and isom compatibility.
+    if major in ISO_IMAGE_BRANDS:
+        return ISO_IMAGE_BRANDS[major]
+    for brand in compatible:
+        if brand in ISO_IMAGE_BRANDS:
+            return ISO_IMAGE_BRANDS[brand]
+    for brand in [major, *compatible]:
+        if brand in ISO_GENERIC_IMAGE_BRANDS:
+            return ISO_GENERIC_IMAGE_BRANDS[brand]
+    if b"qt  " in [major, *compatible]:
+        return "video/quicktime", ".mov"
+    if any(brand in ISO_VIDEO_BRANDS for brand in [major, *compatible]):
+        return "video/mp4", ".mp4"
+    return None
+
+
 def media_type(path):
     with open(path, "rb") as source:
-        h = source.read(32)
+        # ftyp is small; bound header reads even for multi-gigabyte files.
+        h = source.read(65536)
     if h.startswith(b"\xff\xd8\xff"):
         return "image/jpeg", ".jpg"
     if h.startswith(b"\x89PNG\r\n\x1a\n"):
         return "image/png", ".png"
     if h[:4] == b"RIFF" and h[8:12] == b"WEBP":
         return "image/webp", ".webp"
-    if len(h) >= 12 and h[4:8] == b"ftyp":
-        return "video/mp4", ".mp4"
+    if len(h) >= 8 and h[4:8] == b"ftyp":
+        return iso_media_type(h)
     if h.startswith(b"\x1aE\xdf\xa3"):
         return "video/webm", ".webm"
     if h[:4] == b"RIFF" and h[8:12] == b"AVI ":
@@ -129,8 +174,13 @@ def make_app(cfg, storage):
             return
         message = update.message
         item = message.photo[-1] if message.photo else message.video or message.document
-        if not item or (message.document and not (item.mime_type or "").startswith(("image/", "video/"))):
+        if not item:
             return
+        if message.document and not (item.mime_type or "").startswith(("image/", "video/")):
+            # Some Telegram clients label HEIF photos as application/octet-stream.
+            # The suffix only permits inspection; the header must still match below.
+            if Path(item.file_name or "").suffix.lower() not in ISO_IMAGE_EXTENSIONS:
+                return
         if not item.file_size or item.file_size > cfg["limit"]:
             await message.reply_text("Файл слишком большой. Максимум: %s MB." % (cfg["limit"] // 1024**2))
             return
