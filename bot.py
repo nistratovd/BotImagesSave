@@ -14,6 +14,10 @@ from telegram.ext import Application, CommandHandler, MessageHandler, ContextTyp
 
 LOG = logging.getLogger("media_archive")
 DEFAULT_STORAGE = "/var/lib/botimagessave/media"
+UNSUPPORTED_FORMAT_MESSAGE = (
+    "Неподдерживаемый формат файла. Можно загрузить фото "
+    "(JPEG, PNG, WebP, HEIC/HEIF, AVIF) или видео (MP4, MOV, WebM/MKV, AVI)."
+)
 
 
 def load_config(path):
@@ -175,11 +179,13 @@ def make_app(cfg, storage):
         message = update.message
         item = message.photo[-1] if message.photo else message.video or message.document
         if not item:
+            await message.reply_text(UNSUPPORTED_FORMAT_MESSAGE)
             return
         if message.document and not (item.mime_type or "").startswith(("image/", "video/")):
             # Some Telegram clients label HEIF photos as application/octet-stream.
             # The suffix only permits inspection; the header must still match below.
             if Path(item.file_name or "").suffix.lower() not in ISO_IMAGE_EXTENSIONS:
+                await message.reply_text(UNSUPPORTED_FORMAT_MESSAGE)
                 return
         if not item.file_size or item.file_size > cfg["limit"]:
             await message.reply_text("Файл слишком большой. Максимум: %s MB." % (cfg["limit"] // 1024**2))
@@ -209,6 +215,7 @@ def make_app(cfg, storage):
                     raise ValueError("Downloaded file exceeds limit")
                 kind = media_type(path)
                 if not kind:
+                    await message.reply_text(UNSUPPORTED_FORMAT_MESSAGE)
                     return
                 _, suffix = kind
                 name = f"{message.chat_id}_{message.message_id}{suffix}"
@@ -230,7 +237,7 @@ def make_app(cfg, storage):
                    .read_timeout(600).write_timeout(600))
     app = builder.build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO | filters.Document.ALL, receive))
+    app.add_handler(MessageHandler(filters.ATTACHMENT, receive))
     app.add_error_handler(error_handler)
     return app
 

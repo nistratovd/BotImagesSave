@@ -156,8 +156,45 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         update.message.photo = []
         update.message.video = None
         update.message.document.mime_type = 'application/pdf'
+        update.message.document.file_name = 'report.pdf'
+        update.message.reply_text.reset_mock()
         await app.handlers[0][1].callback(update, None)
+        update.message.reply_text.assert_awaited_once_with(bot.UNSUPPORTED_FORMAT_MESSAGE)
+        update.message.document.get_file.assert_not_called()
         storage.save.assert_not_called()
+
+    async def test_unsupported_attachment_routing(self):
+        from unittest.mock import AsyncMock
+        from telegram import Update
+        storage = MagicMock()
+        app = bot.make_app(self.config(), storage)
+        handler = app.handlers[0][1]
+        base = {'file_id': 'file', 'file_unique_id': 'unique', 'duration': 1}
+        for field, attachment in [
+            ('audio', base), ('voice', base),
+            ('animation', dict(base, width=10, height=10)),
+            ('sticker', dict(base, width=10, height=10, is_animated=False,
+                             is_video=False, type='regular')),
+        ]:
+            with self.subTest(field=field):
+                message = {'message_id': 1, 'date': 0,
+                           'chat': {'id': 123, 'type': 'private'}, field: attachment}
+                update = Update.de_json({'update_id': 1, 'message': message}, app.bot)
+                self.assertTrue(handler.check_update(update))
+                mock_update = MagicMock()
+                mock_update.effective_chat.type = 'private'
+                mock_update.effective_user.id = 123
+                mock_update.message.photo = []
+                mock_update.message.video = None
+                mock_update.message.document = None
+                mock_update.message.reply_text = AsyncMock()
+                await handler.callback(mock_update, None)
+                mock_update.message.reply_text.assert_awaited_once_with(bot.UNSUPPORTED_FORMAT_MESSAGE)
+        storage.save.assert_not_called()
+        text_update = Update.de_json({'update_id': 2, 'message': {
+            'message_id': 2, 'date': 0, 'chat': {'id': 123, 'type': 'private'},
+            'text': 'hello'}}, app.bot)
+        self.assertFalse(handler.check_update(text_update))
 
     async def test_formatted_greeting_from_example(self):
         from unittest.mock import AsyncMock
@@ -294,7 +331,8 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
             message.reply_text.reset_mock()
             await app.handlers[0][1].callback(update, None)
             self.assertEqual(len(list((storage.root / '123').iterdir())), 1)
-            message.reply_text.assert_not_awaited()
+            message.reply_text.assert_awaited_once_with(bot.UNSUPPORTED_FORMAT_MESSAGE)
+            self.assertEqual(list(storage.root.glob('.tg-media-*')), [])
 
     async def test_disallowed_user_and_large_video(self):
         from unittest.mock import AsyncMock
